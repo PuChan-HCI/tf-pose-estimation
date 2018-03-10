@@ -182,22 +182,34 @@ class PoseEstimator:
     def score_pairs(part_idx1, part_idx2, coord_list1, coord_list2, paf_mat_x, paf_mat_y, heatmap, rescale=(1.0, 1.0)):
         connection_temp = []
 
-        cnt = 0
-        for idx1, (y1, x1) in enumerate(zip(coord_list1[0], coord_list1[1])):
-            for idx2, (y2, x2) in enumerate(zip(coord_list2[0], coord_list2[1])):
-                score, count = PoseEstimator.get_score(x1, y1, x2, y2, paf_mat_x, paf_mat_y)
-                cnt += 1
-                if count < PoseEstimator.PAF_Count_Threshold or score <= 0.0:
-                    continue
-                connection_temp.append(PoseEstimator.PartPair(
-                    score=score,
-                    part_idx1=part_idx1, part_idx2=part_idx2,
-                    idx1=idx1, idx2=idx2,
-                    coord1=(x1 * rescale[0], y1 * rescale[1]),
-                    coord2=(x2 * rescale[0], y2 * rescale[1]),
-                    score1=heatmap[part_idx1][y1][x1],
-                    score2=heatmap[part_idx2][y2][x2],
-                ))
+        xlist = np.stack(np.meshgrid(
+            coord_list2[0], coord_list1[0]), axis=2).reshape(-1, 2)
+        ylist = np.stack(np.meshgrid(
+            coord_list2[1], coord_list1[1]), axis=2).reshape(-1, 2)
+        coord_list = np.concatenate((xlist, ylist), axis=1)
+
+        idx1 = np.arange(len(coord_list1[0]))
+        idx2 = np.arange(len(coord_list2[0]))
+        idx_list = np.stack(np.meshgrid(idx2, idx1), axis=2).reshape((-1, 2))
+
+        score, count = PoseEstimator.get_score(
+            coord_list, paf_mat_x, paf_mat_y)
+
+        idx = np.logical_and(
+            count >= PoseEstimator.PAF_Count_Threshold, score > 0.0)
+
+        for s, c, i in zip(score[idx], coord_list[idx], idx_list[idx]):
+            idx2, idx1 = i
+            y2, y1, x2, x1 = c
+            connection_temp.append(PoseEstimator.PartPair(
+                score=s,
+                part_idx1=part_idx1, part_idx2=part_idx2,
+                idx1=idx1, idx2=idx2,
+                coord1=(x1 * rescale[0], y1 * rescale[1]),
+                coord2=(x2 * rescale[0], y2 * rescale[1]),
+                score1=heatmap[part_idx1][y1][x1],
+                score2=heatmap[part_idx2][y2][x2],
+            ))
 
         connection = []
         used_idx1, used_idx2 = set(), set()
@@ -212,37 +224,47 @@ class PoseEstimator:
         return connection
 
     @staticmethod
-    def get_score(x1, y1, x2, y2, paf_mat_x, paf_mat_y):
+    def get_score(coord_list, paf_mat_x, paf_mat_y):
+        h, w = paf_mat_x.shape
+        paf_mat_x.reshape(-1), paf_mat_y.reshape(-1)
+        return PoseEstimator.get_score_impl(coord_list, paf_mat_x.reshape(-1), paf_mat_y.reshape(-1), h, w)
+
+    @staticmethod
+    def get_score_impl(coord_list, paf_mat_x, paf_mat_y, h, w):
         __num_inter = 10
         __num_inter_f = float(__num_inter)
-        dx, dy = x2 - x1, y2 - y1
-        normVec = math.sqrt(dx ** 2 + dy ** 2)
+        dx, dy = coord_list[:, 2] - coord_list[:,
+                                               3], coord_list[:, 0] - coord_list[:, 1]
+        normVec = np.sqrt(dx ** 2 + dy ** 2)
 
-        if normVec < 1e-4:
-            return 0.0, 0
+        idx = normVec >= 1e-4
 
-        vx, vy = dx / normVec, dy / normVec
+        _dx = dx[idx][:, None]
+        _dy = dy[idx][:, None]
+        _coord_list = coord_list[idx][:, None]
+        _normVec = normVec[idx][:, None]
 
-        xs = np.arange(x1, x2, dx / __num_inter_f) if x1 != x2 else np.full((__num_inter,), x1)
-        ys = np.arange(y1, y2, dy / __num_inter_f) if y1 != y2 else np.full((__num_inter,), y1)
-        xs = (xs + 0.5).astype(np.int8)
-        ys = (ys + 0.5).astype(np.int8)
+        score = np.zeros(len(coord_list), np.float32)
+        count = np.zeros(len(coord_list), np.int)
 
-        # without vectorization
-        pafXs = np.zeros(__num_inter)
-        pafYs = np.zeros(__num_inter)
-        for idx, (mx, my) in enumerate(zip(xs, ys)):
-            pafXs[idx] = paf_mat_x[my][mx]
-            pafYs[idx] = paf_mat_y[my][mx]
+        xs = np.arange(__num_inter) * (_dx / __num_inter_f) + \
+            _coord_list[:, :, 3]
+        ys = np.arange(__num_inter) * (_dy / __num_inter_f) + \
+            _coord_list[:, :, 1]
+        xsc = (xs + 0.5).astype(np.int32)
+        ysc = (ys + 0.5).astype(np.int32)
+        index = ysc * w + xsc
 
-        # vectorization slow?
-        # pafXs = pafMatX[ys, xs]
-        # pafYs = pafMatY[ys, xs]
-
-        local_scores = pafXs * vx + pafYs * vy
+        local_scores = (
+            _dx * paf_mat_x[index.ravel()].reshape(-1, __num_inter) +
+            _dy * paf_mat_y[index.ravel()].reshape(-1, __num_inter)) / _normVec
         thidxs = local_scores > PoseEstimator.Local_PAF_Threshold
+        scores = local_scores * thidxs
 
-        return sum(local_scores * thidxs), sum(thidxs)
+        score[idx] = np.sum(scores, axis=1)
+        count[idx] = np.sum(thidxs, axis=1)
+        
+        return score, count
 
 
 class TfPoseEstimator:
@@ -264,13 +286,16 @@ class TfPoseEstimator:
         #     print(op.name)
 
         self.tensor_image = self.graph.get_tensor_by_name('TfPoseEstimator/image:0')
-        self.tensor_output = self.graph.get_tensor_by_name('TfPoseEstimator/Openpose/concat_stage7:0')
+        self.tensor_output1 = self.graph.get_tensor_by_name(
+            'TfPoseEstimator/Openpose/MConv_Stage2_L2_5_pointwise/BatchNorm/FusedBatchNorm:0')
+        self.tensor_output2 = self.graph.get_tensor_by_name(
+            'TfPoseEstimator/Openpose/MConv_Stage2_L1_5_pointwise/BatchNorm/FusedBatchNorm:0')
 
         self.heatMat = self.pafMat = None
 
         # warm-up
         self.persistent_sess.run(
-            self.tensor_output,
+            [self.tensor_output1, self.tensor_output2],
             feed_dict={
                 self.tensor_image: [np.ndarray(shape=(target_size[1], target_size[0], 3), dtype=np.float32)]
             }
@@ -405,7 +430,9 @@ class TfPoseEstimator:
             infos.extend(info)
 
         logger.debug('inference+')
-        output = self.persistent_sess.run(self.tensor_output, feed_dict={self.tensor_image: rois})
+        output1, output2 = self.persistent_sess.run(
+                [self.tensor_output1, self.tensor_output2], feed_dict={self.tensor_image: rois})
+        output = np.concatenate((output1, output2), axis=3)
         heatMats = output[:, :, :, :19]
         pafMats = output[:, :, :, 19:]
         logger.debug('inference-')
